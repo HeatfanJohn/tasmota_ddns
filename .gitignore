@@ -1,0 +1,9 @@
+# Secrets and environment variables
+.env
+
+# Cached data files
+ip_cache.json
+
+# Optional: Ignore all JSON cache files in the future
+*_cache.json
+

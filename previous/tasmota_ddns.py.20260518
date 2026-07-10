@@ -1,0 +1,152 @@
+import os
+import sys
+import json
+import logging
+import paho.mqtt.client as mqtt
+import requests
+
+# --- CONFIGURE LOGGING ENGINE ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# --- CONFIGURATION FROM ENVIRONMENT VARIABLES ---
+MQTT_BROKER = os.getenv("MQTT_BROKER")
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "tele/+/INFO2")
+
+NOIP_USERNAME = os.getenv("NOIP_USERNAME")
+NOIP_PASSWORD = os.getenv("NOIP_PASSWORD")
+NOIP_DOMAIN_SUFFIX = os.getenv("NOIP_DOMAIN_SUFFIX")
+
+# Correctly targets the standalone, separately mapped cache destination path
+CACHE_FILE = "/app/ip_cache.json"
+
+required_vars = {
+    "MQTT_BROKER": MQTT_BROKER,
+    "NOIP_USERNAME": NOIP_USERNAME,
+    "NOIP_PASSWORD": NOIP_PASSWORD,
+    "NOIP_DOMAIN_SUFFIX": NOIP_DOMAIN_SUFFIX
+}
+
+missing_vars = [var for var, val in required_vars.items() if not val]
+if missing_vars:
+    logging.critical(f"Missing required environment variables: {', '.join(missing_vars)}")
+    sys.exit(1)
+
+# --- CACHE STORAGE MANAGEMENT ---
+ip_cache = {}
+
+def load_cache_from_disk():
+    """Reads the saved IP mapping file on application startup."""
+    global ip_cache
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                ip_cache = json.load(f)
+            logging.info(f"Loaded {len(ip_cache)} cached device(s) from persistent file storage.")
+        except Exception as e:
+            logging.error(f"Failed to read persistent cache file, starting with fresh dictionary: {e}")
+    else:
+        logging.info("No persistent cache file found. A new one will be generated on the next update.")
+
+def save_cache_to_disk():
+    """Writes the current IP memory maps immediately into the persistent file storage."""
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(ip_cache, f, indent=4)
+        logging.info("Persistent cache file successfully synchronized to disk.")
+    except Exception as e:
+        logging.error(f"Failed writing cache update to file: {e}")
+
+
+def update_noip(hostname, internal_ip):
+    """Sends the internal IP address update to No-IP for a specific host."""
+    full_domain = f"{hostname}.{NOIP_DOMAIN_SUFFIX}"
+    
+    if ip_cache.get(hostname) == internal_ip:
+        logging.info(f"Cache Hit: {full_domain} is already known to be at {internal_ip}. Skipping network call.")
+        return
+
+    logging.info(f"Cache Miss: IP changed, new, or unverified for {full_domain}. Initiating No-IP request...")
+    
+    # Official integration URL endpoint
+    url = "https://dynupdate.no-ip.com/nic/update"
+    params = {"hostname": full_domain, "myip": internal_ip}
+    headers = {"User-Agent": "Tasmota Local IP Updater Python/3.3 support@example.com"}
+
+    try:
+        logging.info(f"Sending HTTP GET request to dynupdate.no-ip.com for: {full_domain} -> {internal_ip}")
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            auth=(NOIP_USERNAME, NOIP_PASSWORD),
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            status = response.text.strip()
+            
+            if status.startswith("good") or status.startswith("nochg"):
+                ip_cache[hostname] = internal_ip
+                save_cache_to_disk()
+                
+                if status.startswith("good"):
+                    logging.info(f"Update Success: {full_domain} is now mapped to {internal_ip}")
+                else:
+                    logging.info(f"Sync Notice: No-IP confirms {full_domain} was already set to {internal_ip}.")
+            elif status == "nohost":
+                logging.error(f"API Rejection: Hostname '{full_domain}' does not exist under this account.")
+            elif status == "badauth":
+                logging.error("API Rejection: Invalid No-IP username or password.")
+            else:
+                logging.warning(f"Unexpected No-IP API response for {full_domain}: {status}")
+        else:
+            logging.error(f"HTTP Failure (Status {response.status_code}): Failed to reach No-IP API.")
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error while connecting to No-IP: {e}")
+
+
+def on_message(client, userdata, msg):
+    """MQTT Callback function that triggers when a Tasmota device sends its INFO2 boot packet."""
+    try:
+        logging.info(f"MQTT Traffic Detected on topic: {msg.topic}")
+        payload = json.loads(msg.payload.decode())
+        
+        hostname = payload["Info2"]["Hostname"]
+        internal_ip = payload["Info2"]["IPAddress"]
+
+        logging.info(f"Parsed Tasmota Data -> Device Hostname: {hostname} | Internal IP: {internal_ip}")
+        update_noip(hostname, internal_ip)
+
+    except KeyError:
+        logging.error("Received malformed MQTT payload (Missing Info2, Hostname, or IPAddress JSON keys).")
+    except Exception as e:
+        logging.error(f"Unexpected error processing MQTT payload: {e}")
+
+
+# --- STARTUP WORKFLOW ---
+load_cache_from_disk()
+
+# FIXED: Explicitly defined CallbackAPIVersion.VERSION1 to stop the DeprecationWarning
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+client.on_message = on_message
+
+logging.info(f"Attempting connection to MQTT Broker at '{MQTT_BROKER}' on port 1883...")
+try:
+    client.connect(MQTT_BROKER, 1883, 60)
+    logging.info("MQTT Broker connection successfully established.")
+except Exception as e:
+    logging.critical(f"Failed to connect to MQTT broker: {e}")
+    sys.exit(1)
+
+logging.info(f"Subscribing to MQTT topic pattern: {MQTT_TOPIC}")
+client.subscribe(MQTT_TOPIC)
+
+logging.info("Initialization complete. Listening for Tasmota IP events...")
+client.loop_forever()
+
