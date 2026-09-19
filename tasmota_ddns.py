@@ -3,11 +3,13 @@ import sys
 import json
 import logging
 import threading
+import time
+import subprocess
 import paho.mqtt.client as mqtt
 import requests
 
 # --- APPLICATION VERSION ---
-VERSION = "4.6.0"
+VERSION = "4.6.1"
 
 # --- CONFIGURE LOGGING ENGINE ---
 logging.basicConfig(
@@ -64,6 +66,45 @@ def save_cache_to_disk():
         logging.error(f"Failed writing cache update to file: {e}")
 
 
+def get_mac_address(ip, retries=3, delay=1):
+    """
+    Resolves an IP address to a MAC address via /proc/net/arp.
+    Forces an ARP refresh via ping if the MAC is missing or returns all zeros.
+    """
+    for attempt in range(1, retries + 1):
+        # 1. Send a quick single ping to force host OS ARP table update
+        try:
+            subprocess.run(
+                ["ping", "-c", "1", "-W", "1", ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            logging.warning(f"Failed to execute ARP ping check: {e}")
+
+        time.sleep(0.2)
+
+        # 2. Parse /proc/net/arp for the IP address
+        if os.path.exists("/proc/net/arp"):
+            try:
+                with open("/proc/net/arp", "r") as arp_file:
+                    for line in arp_file:
+                        if ip in line:
+                            parts = line.split()
+                            if len(parts) >= 4:
+                                mac = parts[3].upper()
+                                # Validate it is not empty or dummy zero MAC
+                                if mac and mac != "00:00:00:00:00:00":
+                                    return mac
+            except Exception as e:
+                logging.error(f"Error reading /proc/net/arp: {e}")
+
+        logging.warning(f"MAC address for {ip} not resolved on attempt {attempt}/{retries}. Retrying in {delay}s...")
+        time.sleep(delay)
+
+    return None
+
+
 def update_external_services_worker(hostname, internal_ip):
     """Worker execution running inside an isolated background thread for slow network I/O."""
     full_domain = f"{hostname}.{NOIP_DOMAIN_SUFFIX}"
@@ -73,7 +114,6 @@ def update_external_services_worker(hostname, internal_ip):
         logging.info(f"Cache Hit: {full_domain} is already known to be at {internal_ip}. Skipping No-IP sync.")
     else:
         logging.info(f"Cache Miss: IP changed or new for {full_domain}. Initiating No-IP request...")
-        # Official integration URL endpoint
         url = "https://dynupdate.no-ip.com/nic/update"
         params = {"hostname": full_domain, "myip": internal_ip}
         headers = {"User-Agent": f"Tasmota Local IP Updater Python/{VERSION} support@example.com"}
@@ -97,18 +137,10 @@ def update_external_services_worker(hostname, internal_ip):
     try:
         logging.info(f"Resolving MAC Address for {internal_ip}...")
         
-        mac_address = None
-        if os.path.exists("/proc/net/arp"):
-            with open("/proc/net/arp", "r") as arp_file:
-                for line in arp_file:
-                    if internal_ip in line:
-                        parts = line.split()
-                        if len(parts) >= 4:
-                            mac_address = parts[3].upper()
-                            break
+        mac_address = get_mac_address(internal_ip)
 
         if not mac_address:
-            logging.error(f"NetAlertX Sync Failure: Could not find a MAC address mapping for IP {internal_ip} in host ARP cache.")
+            logging.error(f"NetAlertX Sync Failure: Could not resolve a valid MAC address for IP {internal_ip} after retries. Skipping update.")
             return
 
         logging.info(f"Resolved MAC Address for {internal_ip} -> {mac_address}")
@@ -116,7 +148,6 @@ def update_external_services_worker(hostname, internal_ip):
         base_url = NETALERTX_URL.rstrip('/')
         netalertx_endpoint = f"{base_url}/device/{mac_address}/update-column"
         
-        # FIXED: Modified the payload parameters to use columnName and columnValue keys 
         payload = {
             "columnName": "devName",
             "columnValue": hostname
@@ -207,4 +238,3 @@ try:
 except Exception as e:
     logging.critical(f"Failed to start execution loop: {e}")
     sys.exit(1)
-
